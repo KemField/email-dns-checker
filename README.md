@@ -11,7 +11,7 @@
     <strong>A professional, high-fidelity diagnostic dashboard designed to inspect, grade, and troubleshoot domain email deliverability and DNS health.</strong>
   </p>
 
-  <sub>Built with modern PHP 8, Vanilla JS (ES6), and Tailwind CSS.</sub>
+  <sub>Built with modern PHP 8+, Vanilla JS (ES6 Module Architecture), and Tailwind CSS.</sub>
 </div>
 
 ---
@@ -19,11 +19,12 @@
 ### 📖 Table of Contents
 1. [🔍 Overview](#-overview)
 2. [🛡️ Why Email Deliverability Setup Matters](#️-why-email-deliverability-setup-matters)
-3. [✨ Key Features](#-key-features)
-4. [💻 Tech Stack](#-tech-stack)
-5. [⚙️ Installation & Local Setup](#️-installation--local-setup)
-6. [📊 Scoring Matrix](#-scoring-matrix)
-7. [📄 License](#-license)
+3. [🏗️ Architecture & Security Patterns](#-architecture--security-patterns)
+4. [✨ Key Features](#-key-features)
+5. [💻 Tech Stack](#-tech-stack)
+6. [⚙️ Installation & Local Setup](#️-installation--local-setup)
+7. [📊 Scoring Matrix](#-scoring-matrix)
+8. [📄 License](#-license)
 
 ---
 
@@ -57,22 +58,70 @@ Incoming Email ──► [ SPF Check ] ──► [ DKIM Check ] ──► [ DMAR
 
 ---
 
+## 🏗️ Architecture & Security Patterns
+
+The application conforms to a strict separation of concerns, dividing execution into distinct logical layers on the client side and securing DNS query workflows against common security vulnerabilities.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ 1. UI Layer (render.js / index.php)                             │
+│    - Renders high-fidelity OLED styles, SVGs, progress gauges   │
+└───────────────┬─────────────────────────────────────────────────┘
+                │
+                ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 2. Logic Layer (state.js / useRateLimiter.js)                   │
+│    - Reactive state, search countdown timers, client throttles   │
+└───────────────┬─────────────────────────────────────────────────┘
+                │
+                ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 3. API Layer (dnsService.js)                                    │
+│    - AbortController wrappers with 8s connection thresholds     │
+└───────────────┬─────────────────────────────────────────────────┘
+                │
+                ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 4. Security Layer (sanitizer.js)                                │
+│    - RFC 1035 check, XSS entities encoding, clipboard safeguards│
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 🔒 Server-Side SSRF Protection
+To prevent **Server-Side Request Forgery (SSRF)** attacks during domain name evaluations, the PHP backend:
+1. Performs DNS resolution to extract destination IP addresses.
+2. Checks IPs against private, loopback, and local networks including:
+   - Loopback: `127.0.0.0/8`, `::1`
+   - Private subnets: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`
+   - Link-local and Unique Local: `169.254.0.0/16`, `fc00::/7`, `fe80::/10`
+3. Aborts connections immediately if a private destination is detected.
+
+### 🛡️ Client-Side XSS & Clipboard Protections
+- **XSS Mitigation:** All DNS record results are processed via an HTML entity encoder (`Sanitizer.sanitizeHTML`) before being rendered into the DOM, preventing execution of injected payloads.
+- **Clipboard Defense:** Before writing reports to the system clipboard, control codes and dynamic URI schemes (like `javascript:`) are filtered to block command/payload injection.
+
+### ⏱️ Session Rate Limiting
+- The backend API implements session-based rate limiting (Max 10 requests per minute), sending `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `Retry-After` headers.
+- The client UI tracks lockouts and renders a disabled button state with a ticking lockout timer countdown.
+
+---
+
 ## ✨ Key Features
 
 *   **Live DNS Queries**: Leverages native PHP networking functions (`dns_get_record`) to fetch MX, SPF, DMARC, and custom-selector DKIM records.
-*   **SSL Handshake Analyzer**: Opens secure stream sockets over port 443 to inspect certificate validation ranges, issuer authorities, and remaining lifetimes.
-*   **Support Desk Clipboard Tool**: Instantly exports full test details into a structured Markdown block, making it easy to copy and paste findings into client support tickets.
-*   **Level-2 Support Tips**: Displays descriptive, context-specific tips telling you *why* a record is wrong and *how* to change it in your cPanel, Cloudflare, or Route 53 console.
-*   **Offline / Preset Simulator**: Safely runs on local offline environments using simulated presets (`demo-perfect.com`, `demo-warning.org`, `demo-critical.net`). If internet access fails, it transitions to fallback mock data dynamically.
-*   **Responsive Dark Interface**: Premium glassmorphic look utilizing dynamic progress gauges, glow states, and transition animations.
+*   **SSL Handshake Analyzer**: Opens secure stream sockets over port 443 with strict peer verification (`verify_peer` and `verify_peer_name`) and validated cert chain structures.
+*   **Support Desk Clipboard Tool**: Instantly exports full test details into a structured Markdown block, filtered for safety before clipboard transfer.
+*   **Level-2 Support Tips**: Displays descriptive, context-specific tips telling you *why* a record is wrong and *how* to change it in your DNS panel.
+*   **Offline / Preset Simulator**: Safely runs on local offline environments using simulated presets (`demo-perfect.com`, `demo-warning.org`, `demo-critical.net`). If internet access fails, it transitions to fallback mock data dynamically, flagging reports with `is_simulated = true`.
+*   **WCAG AAA Accessible Design**: Uses Phosphor-aligned SVG status icons rather than color alone to signal pass/fail results. Employs `aria-live="polite"` dynamic notification regions, maintaining a minimum 7:1 contrast ratio over deep OLED backgrounds (`#0A0A0F`).
 
 ---
 
 ## 💻 Tech Stack
 
 *   **Backend Logic**: PHP 8.0+ (OOP, type hints, stream socket clients, regular expression parsers).
-*   **Frontend logic**: Vanilla JS (ES6 API fetches, radial SVG transitions, toast controls, clipboard routines).
-*   **Aesthetic Styling**: Tailwind CSS (CDN compilation, CSS transitions, custom SVG canvas nodes).
+*   **Frontend Logic**: Vanilla JS (ES6 Module Architecture, radial SVG transitions, toast controls, clipboard routines).
+*   **Aesthetic Styling**: Vanilla Tailwind CSS (Custom dark grids, skeletons, glow effects).
 
 ---
 
@@ -120,9 +169,9 @@ To compute the overall **Health Score (0-100%)**, the diagnostic backend applies
   └── Expired / Missing SSL          ──► Deduct 20 points
 ```
 
-*   **Score >= 90**: Green Theme (Excellent / Secure)
-*   **Score 60 - 89**: Yellow Theme (Warnings Present)
-*   **Score < 60**: Red Theme (Critical Issues Found)
+- **Score >= 90**: Green Theme (Excellent / Secure)
+- **Score 60 - 89**: Yellow Theme (Warnings Present)
+- **Score < 60**: Red Theme (Critical Issues Found)
 
 ---
 

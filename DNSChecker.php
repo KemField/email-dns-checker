@@ -43,7 +43,7 @@ class DNSChecker
             $domain = $parsed['host'] ?? $domain;
         }
 
-        // Remove www. prefix if present (optional, but standard for email checks since MX is on apex)
+        // Remove www. prefix if present
         $domain = preg_replace('/^www\./i', '', $domain);
 
         // Split by slash and keep only the hostname
@@ -72,13 +72,88 @@ class DNSChecker
             return;
         }
 
-        // Offline mode fallback: if we cannot resolve google.com, we treat it as demo
-        // to prevent localhost developer setups from throwing empty responses
+        $this->detectOfflineDemo();
+    }
+
+    /**
+     * Helper to detect offline status and set simulator preset.
+     */
+    private function detectOfflineDemo(): void
+    {
         $googleDns = @dns_get_record('google.com', DNS_A);
         if ($googleDns === false || empty($googleDns)) {
             $this->isDemo = true;
             $this->demoPreset = 'offline_sim';
         }
+    }
+
+    /**
+     * Validates that the domain does not resolve to local/private network ranges (SSRF protection).
+     */
+    private function validateSSRF(): void
+    {
+        if ($this->isDemo) {
+            return;
+        }
+
+        $ips = @gethostbynamel($this->domain);
+        if ($ips === false || empty($ips)) {
+            // Cannot resolve domain, might be offline or blocked network environment.
+            $this->isDemo = true;
+            $this->demoPreset = 'offline_sim';
+            return;
+        }
+
+        foreach ($ips as $ip) {
+            if ($this->isPrivateIp($ip)) {
+                throw new InvalidArgumentException("Security Error: Access to private network addresses is forbidden.");
+            }
+        }
+    }
+
+    /**
+     * Evaluates if a given IP belongs to loopback, private or local ranges.
+     */
+    private function isPrivateIp(string $ip): bool
+    {
+        if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) === false) {
+            return true;
+        }
+
+        $parts = explode('.', $ip);
+        if (count($parts) === 4) {
+            $first = (int)$parts[0];
+            $second = (int)$parts[1];
+            if ($first === 127 || $first === 10 || $first === 0) {
+                return true;
+            }
+            if ($first === 172 && ($second >= 16 && $second <= 31)) {
+                return true;
+            }
+            if ($first === 192 && $second === 168) {
+                return true;
+            }
+            if ($first === 169 && $second === 254) {
+                return true;
+            }
+        }
+
+        return $this->isPrivateIpV6($ip);
+    }
+
+    /**
+     * Checks if given IP matches IPv6 private ranges.
+     */
+    private function isPrivateIpV6(string $ip): bool
+    {
+        $lowerIp = strtolower(trim($ip));
+        $forbiddenV6Prefixes = ['::1', 'fe80:', 'fc00:', 'fd00:'];
+        foreach ($forbiddenV6Prefixes as $prefix) {
+            if (str_starts_with($lowerIp, $prefix)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -88,6 +163,8 @@ class DNSChecker
      */
     public function check(): array
     {
+        $this->validateSSRF();
+
         if ($this->isDemo) {
             return $this->getSimulatedResults();
         }
@@ -95,6 +172,7 @@ class DNSChecker
         $results = [
             'domain' => $this->domain,
             'is_demo' => false,
+            'is_simulated' => false,
             'checks' => [
                 'mx' => $this->checkMX(),
                 'spf' => $this->checkSPF(),
@@ -117,23 +195,7 @@ class DNSChecker
         $records = @dns_get_record($this->domain, DNS_MX);
 
         if (empty($records)) {
-            // Fallback: check if A record exists (some mail systems fallback to A)
-            $aRecords = @dns_get_record($this->domain, DNS_A);
-            if (empty($aRecords)) {
-                return [
-                    'status' => 'critical',
-                    'records' => [],
-                    'message' => 'No MX or A records found. This domain cannot receive emails.',
-                    'tip' => 'Add an MX record pointing to your mail server (e.g., mail.yourdomain.com or googlemx) in your DNS panel (cPanel, Cloudflare, AWS Route 53) to route incoming emails correctly.'
-                ];
-            } else {
-                return [
-                    'status' => 'warning',
-                    'records' => [],
-                    'message' => 'No MX records found, but A record exists. Mail delivery might fallback to A, which is deprecated.',
-                    'tip' => 'Add an explicit MX record. While legacy mail servers may fallback to the A record to locate your mail host, modern spam filters require explicit MX records.'
-                ];
-            }
+            return $this->handleMissingMX();
         }
 
         $mxList = [];
@@ -156,6 +218,28 @@ class DNSChecker
     }
 
     /**
+     * Fallback verification when MX record is missing.
+     */
+    private function handleMissingMX(): array
+    {
+        $aRecords = @dns_get_record($this->domain, DNS_A);
+        if (empty($aRecords)) {
+            return [
+                'status' => 'critical',
+                'records' => [],
+                'message' => 'No MX or A records found. This domain cannot receive emails.',
+                'tip' => 'Add an MX record pointing to your mail server (e.g., mail.yourdomain.com) in your DNS panel (cPanel, Cloudflare, AWS Route 53) to route incoming emails correctly.'
+            ];
+        }
+        return [
+            'status' => 'warning',
+            'records' => [],
+            'message' => 'No MX records found, but A record exists. Mail delivery might fallback to A, which is deprecated.',
+            'tip' => 'Add an explicit MX record. While legacy mail servers may fallback to the A record to locate your mail host, modern spam filters require explicit MX records.'
+        ];
+    }
+
+    /**
      * Verifies Sender Policy Framework (SPF) records.
      */
     private function checkSPF(): array
@@ -172,6 +256,14 @@ class DNSChecker
             }
         }
 
+        return $this->evaluateSpfRecords($spfRecords);
+    }
+
+    /**
+     * Evaluates found SPF records.
+     */
+    private function evaluateSpfRecords(array $spfRecords): array
+    {
         if (empty($spfRecords)) {
             return [
                 'status' => 'critical',
@@ -186,13 +278,12 @@ class DNSChecker
                 'status' => 'critical',
                 'record' => implode(' | ', $spfRecords),
                 'message' => 'Multiple SPF records found. This violates RFC standards and invalidates SPF checks.',
-                'tip' => 'You must merge your SPF configs into a single TXT record. Combining "v=spf1 include:spf.protection.outlook.com ~all" and "v=spf1 include:_spf.google.com ~all" into "v=spf1 include:spf.protection.outlook.com include:_spf.google.com ~all".'
+                'tip' => 'You must merge your SPF configs into a single TXT record. Combining multiple SPF lines is invalid under standard DNS protocols.'
             ];
         }
 
         $spf = $spfRecords[0];
 
-        // Analyze mechanisms
         if (str_contains($spf, '+all')) {
             return [
                 'status' => 'warning',
@@ -227,6 +318,14 @@ class DNSChecker
             }
         }
 
+        return $this->evaluateDmarcRecords($dmarcRecords);
+    }
+
+    /**
+     * Evaluates found DMARC records.
+     */
+    private function evaluateDmarcRecords(array $dmarcRecords): array
+    {
         if (empty($dmarcRecords)) {
             return [
                 'status' => 'critical',
@@ -277,35 +376,49 @@ class DNSChecker
         $selector = $this->dkimSelector;
 
         if (empty($selector)) {
-            // Auto-check common selectors
-            foreach (self::COMMON_DKIM_SELECTORS as $s) {
-                $records = @dns_get_record($s . '._domainkey.' . $this->domain, DNS_TXT);
-                if (!empty($records)) {
-                    foreach ($records as $r) {
-                        $txt = $r['txt'] ?? ($r['entries'][0] ?? '');
-                        if (stripos($txt, 'v=DKIM1') === 0 || stripos($txt, 'k=rsa') === 0 || str_contains($txt, 'p=')) {
-                            return [
-                                'status' => 'valid',
-                                'record' => $txt,
-                                'selector_used' => $s,
-                                'message' => 'DKIM record auto-detected under common selector "' . htmlspecialchars($s) . '".',
-                                'tip' => 'DKIM record was successfully identified under the default selector "' . htmlspecialchars($s) . '". If you use a custom selector, specify it in the optional DKIM input to verify.'
-                            ];
-                        }
+            return $this->autoDetectDKIM();
+        }
+
+        return $this->queryDKIM($selector);
+    }
+
+    /**
+     * Attempts to query standard selector namespaces automatically if none is specified.
+     */
+    private function autoDetectDKIM(): array
+    {
+        foreach (self::COMMON_DKIM_SELECTORS as $s) {
+            $records = @dns_get_record($s . '._domainkey.' . $this->domain, DNS_TXT);
+            if (!empty($records)) {
+                foreach ($records as $r) {
+                    $txt = $r['txt'] ?? ($r['entries'][0] ?? '');
+                    if (stripos($txt, 'v=DKIM1') === 0 || stripos($txt, 'k=rsa') === 0 || str_contains($txt, 'p=')) {
+                        return [
+                            'status' => 'valid',
+                            'record' => $txt,
+                            'selector_used' => $s,
+                            'message' => 'DKIM record auto-detected under common selector "' . htmlspecialchars($s) . '".',
+                            'tip' => 'DKIM record was successfully identified under the default selector "' . htmlspecialchars($s) . '". If you use a custom selector, specify it in the optional DKIM input to verify.'
+                        ];
                     }
                 }
             }
-
-            return [
-                'status' => 'info',
-                'record' => null,
-                'selector_used' => null,
-                'message' => 'No DKIM records found under standard selectors (default, google, mail, k1, sig1).',
-                'tip' => 'DKIM keys are published on specific selectors (e.g., mail._domainkey.domain.com). Since no selector was entered, we checked standard names but found none. Please type your actual selector in the field to check.'
-            ];
         }
 
-        // User-defined selector check
+        return [
+            'status' => 'info',
+            'record' => null,
+            'selector_used' => null,
+            'message' => 'No DKIM records found under standard selectors (default, google, mail, k1, sig1).',
+            'tip' => 'DKIM keys are published on specific selectors (e.g., mail._domainkey.domain.com). Since no selector was entered, we checked standard names but found none. Please type your actual selector in the field to check.'
+        ];
+    }
+
+    /**
+     * Queries a specific DKIM record using selector.
+     */
+    private function queryDKIM(string $selector): array
+    {
         $records = @dns_get_record($selector . '._domainkey.' . $this->domain, DNS_TXT);
         $dkimRecords = [];
 
@@ -345,11 +458,13 @@ class DNSChecker
         $port = 443;
         $timeout = 5;
 
+        // Secure context options: enforce validation of peer and host certificates.
         $context = stream_context_create([
             'ssl' => [
                 'capture_peer_cert' => true,
-                'verify_peer' => false,
-                'verify_peer_name' => false
+                'verify_peer' => true,
+                'verify_peer_name' => true,
+                'allow_self_signed' => false,
             ]
         ]);
 
@@ -363,22 +478,7 @@ class DNSChecker
         );
 
         if (!$client) {
-            // Test if domain is alive on standard HTTP (port 80)
-            $tcp = @fsockopen($this->domain, 80, $errno, $errstr, $timeout);
-            if (!$tcp) {
-                return [
-                    'status' => 'critical',
-                    'message' => 'Could not connect to domain over HTTP (port 80) or HTTPS (port 443). Domain is offline or DNS routing is broken.',
-                    'tip' => 'Verify your domain registrars and web server IPs. Check if server firewall settings block incoming port 80/443 traffic.'
-                ];
-            }
-            @fclose($tcp);
-
-            return [
-                'status' => 'critical',
-                'message' => 'HTTPS port 443 is closed or SSL certificate is missing.',
-                'tip' => 'Secure socket connection failed. Install an SSL certificate (e.g. free Let\'s Encrypt or Cloudflare SSL proxy) and open port 443 in your server firewall configurations.'
-            ];
+            return $this->handleSslConnectionFailure($timeout);
         }
 
         $params = stream_context_get_params($client);
@@ -401,6 +501,36 @@ class DNSChecker
             ];
         }
 
+        return $this->evaluateCertificate($cert);
+    }
+
+    /**
+     * Fallback network test when SSL connection port 443 fails.
+     */
+    private function handleSslConnectionFailure(int $timeout): array
+    {
+        $tcp = @fsockopen($this->domain, 80, $errno, $errstr, $timeout);
+        if (!$tcp) {
+            return [
+                'status' => 'critical',
+                'message' => 'Could not connect to domain over HTTP (port 80) or HTTPS (port 443). Domain is offline or DNS routing is broken.',
+                'tip' => 'Verify your domain registrars and web server IPs. Check if server firewall settings block incoming port 80/443 traffic.'
+            ];
+        }
+        @fclose($tcp);
+
+        return [
+            'status' => 'critical',
+            'message' => 'HTTPS port 443 is closed, SSL certificate is missing, or cert verification failed.',
+            'tip' => 'Secure socket connection or verification failed. Make sure a valid, non-self-signed certificate is installed and port 443 is open.'
+        ];
+    }
+
+    /**
+     * Checks validation dates and metadata of parsing certificate.
+     */
+    private function evaluateCertificate(array $cert): array
+    {
         $validFrom = $cert['validFrom_time_t'] ?? 0;
         $validTo = $cert['validTo_time_t'] ?? 0;
         $now = time();
@@ -430,6 +560,15 @@ class DNSChecker
             ];
         }
 
+        return $this->evaluateCertificateExpiry($validTo, $issuer, $subject);
+    }
+
+    /**
+     * Evaluates certificate remaining days.
+     */
+    private function evaluateCertificateExpiry(int $validTo, string $issuer, string $subject): array
+    {
+        $now = time();
         $daysRemaining = (int)floor(($validTo - $now) / 86400);
 
         if ($daysRemaining < 30) {
@@ -467,7 +606,7 @@ class DNSChecker
             'mx' => ['critical' => 35, 'warning' => 15],
             'spf' => ['critical' => 30, 'warning' => 15],
             'dmarc' => ['critical' => 20, 'warning' => 10],
-            'dkim' => ['critical' => 15, 'warning' => 5], // 'info' is 0 points deducted
+            'dkim' => ['critical' => 15, 'warning' => 5],
             'ssl' => ['critical' => 20, 'warning' => 10]
         ];
 
@@ -493,111 +632,133 @@ class DNSChecker
         $preset = $this->demoPreset;
         $simDomain = $this->domain;
 
-        // Custom details depending on presets
         if ($preset === 'perfect' || $simDomain === 'demo-perfect.com') {
-            return [
-                'domain' => 'demo-perfect.com',
-                'is_demo' => true,
-                'score' => 100,
-                'checks' => [
-                    'mx' => [
-                        'status' => 'valid',
-                        'records' => [
-                            ['host' => 'aspmx.l.google.com', 'pri' => 1],
-                            ['host' => 'alt1.aspmx.l.google.com', 'pri' => 5],
-                            ['host' => 'alt2.aspmx.l.google.com', 'pri' => 5],
-                        ],
-                        'message' => 'Found 3 MX records. Mail routing is correctly configured.',
-                        'tip' => 'Your MX records are active. Ensure the corresponding mail server IP addresses are clean and not blacklisted by spam databases.'
-                    ],
-                    'spf' => [
-                        'status' => 'valid',
-                        'record' => 'v=spf1 include:_spf.google.com include:sendgrid.net ~all',
-                        'message' => 'SPF record is active and correctly configured.',
-                        'tip' => 'Your SPF record is healthy. If you adopt external tools (e.g. Mailchimp, SendGrid, Salesforce), make sure to include their authorization keys inside this single record.'
-                    ],
-                    'dmarc' => [
-                        'status' => 'valid',
-                        'record' => 'v=DMARC1; p=reject; pct=100; rua=mailto:dmarc-reports@demo-perfect.com',
-                        'message' => 'DMARC record is active with policy: p=reject.',
-                        'tip' => 'Great job! Your DMARC policy is actively protecting your brand from email impersonation.'
-                    ],
-                    'dkim' => [
-                        'status' => 'valid',
-                        'record' => 'v=DKIM1; k=rsa; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0Y8x...sXQIDAQAB',
-                        'selector_used' => $this->dkimSelector ?: 'google',
-                        'message' => 'Valid DKIM record found for selector "' . htmlspecialchars($this->dkimSelector ?: 'google') . '".',
-                        'tip' => 'Your DKIM record is correctly configured. Receiver mail servers will use this public key to verify cryptographic signatures of your outgoing messages.'
-                    ],
-                    'ssl' => [
-                        'status' => 'valid',
-                        'issuer' => 'Let\'s Encrypt',
-                        'subject' => 'demo-perfect.com',
-                        'valid_to' => date('Y-m-d H:i:s', time() + 86400 * 180),
-                        'days_remaining' => 180,
-                        'message' => 'SSL certificate is valid. Issuer: Let\'s Encrypt. Active for another 180 days.',
-                        'tip' => 'Your SSL is healthy. Continue monitoring and ensure automatic renewals remain active.'
-                    ]
-                ],
-                'timestamp' => date('c')
-            ];
+            return $this->getPerfectSimulatedResults();
         }
 
         if ($preset === 'warning' || $simDomain === 'demo-warning.org') {
-            return [
-                'domain' => 'demo-warning.org',
-                'is_demo' => true,
-                'score' => 60,
-                'checks' => [
-                    'mx' => [
-                        'status' => 'valid',
-                        'records' => [
-                            ['host' => 'mail.demo-warning.org', 'pri' => 10]
-                        ],
-                        'message' => 'Found 1 MX record. Mail routing is correctly configured.',
-                        'tip' => 'Your MX records are active. Ensure the corresponding mail server IP addresses are clean and not blacklisted by spam databases.'
-                    ],
-                    'spf' => [
-                        'status' => 'warning',
-                        'record' => 'v=spf1 include:_spf.google.com +all',
-                        'message' => 'SPF record contains the highly insecure "+all" mechanism.',
-                        'tip' => 'The "+all" mechanism authorizes every server on the internet to send mail for you. Replace "+all" with "~all" (SoftFail) or "-all" (Fail) immediately.'
-                    ],
-                    'dmarc' => [
-                        'status' => 'warning',
-                        'record' => 'v=DMARC1; p=none; rua=mailto:reports@demo-warning.org',
-                        'message' => 'DMARC is set to monitoring-only policy (p=none).',
-                        'tip' => 'The "p=none" policy is great for initial testing to gather reports, but does not block spoofed emails. Once you confirm your authentic emails align properly, switch the policy to "p=quarantine" or "p=reject".'
-                    ],
-                    'dkim' => [
-                        'status' => 'info',
-                        'record' => null,
-                        'selector_used' => null,
-                        'message' => 'No DKIM records found under standard selectors (default, google, mail, k1, sig1).',
-                        'tip' => 'DKIM keys are published on specific selectors (e.g., mail._domainkey.domain.com). Since no selector was entered, we checked standard names but found none. Please type your actual selector in the field to check.'
-                    ],
-                    'ssl' => [
-                        'status' => 'warning',
-                        'issuer' => 'Sectigo Limited',
-                        'subject' => 'demo-warning.org',
-                        'valid_to' => date('Y-m-d H:i:s', time() + 86400 * 15),
-                        'days_remaining' => 15,
-                        'message' => 'SSL certificate is active but expires soon in 15 days (on ' . date('Y-m-d', time() + 86400 * 15) . ').',
-                        'tip' => 'Set up automated Certbot renewal or contact your domain administrator to replace the certificate soon.'
-                    ]
-                ],
-                'timestamp' => date('c')
-            ];
+            return $this->getWarningSimulatedResults();
         }
 
-        // Default or critical demo presets
-        // (This acts as the default fallback for local/offline developer environments too, so something displays)
         $isOfflineSim = ($preset === 'offline_sim');
+        return $this->getCriticalSimulatedResults($isOfflineSim);
+    }
+
+    /**
+     * Generates simulated perfect parameters.
+     */
+    private function getPerfectSimulatedResults(): array
+    {
+        return [
+            'domain' => 'demo-perfect.com',
+            'is_demo' => true,
+            'is_simulated' => true,
+            'score' => 100,
+            'checks' => [
+                'mx' => [
+                    'status' => 'valid',
+                    'records' => [
+                        ['host' => 'aspmx.l.google.com', 'pri' => 1],
+                        ['host' => 'alt1.aspmx.l.google.com', 'pri' => 5],
+                    ],
+                    'message' => 'Found 2 MX records. Mail routing is correctly configured.',
+                    'tip' => 'Your MX records are active. Ensure the corresponding mail server IP addresses are clean and not blacklisted by spam databases.'
+                ],
+                'spf' => [
+                    'status' => 'valid',
+                    'record' => 'v=spf1 include:_spf.google.com include:sendgrid.net ~all',
+                    'message' => 'SPF record is active and correctly configured.',
+                    'tip' => 'Your SPF record is healthy. If you adopt external tools (e.g. Mailchimp, SendGrid, Salesforce), make sure to include their authorization keys inside this single record.'
+                ],
+                'dmarc' => [
+                    'status' => 'valid',
+                    'record' => 'v=DMARC1; p=reject; pct=100; rua=mailto:dmarc-reports@demo-perfect.com',
+                    'message' => 'DMARC record is active with policy: p=reject.',
+                    'tip' => 'Great job! Your DMARC policy is actively protecting your brand from email impersonation.'
+                ],
+                'dkim' => [
+                    'status' => 'valid',
+                    'record' => 'v=DKIM1; k=rsa; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0Y8x...sXQIDAQAB',
+                    'selector_used' => $this->dkimSelector ?: 'google',
+                    'message' => 'Valid DKIM record found for selector "' . htmlspecialchars($this->dkimSelector ?: 'google') . '".',
+                    'tip' => 'Your DKIM record is correctly configured. Receiver mail servers will use this public key to verify cryptographic signatures of your outgoing messages.'
+                ],
+                'ssl' => [
+                    'status' => 'valid',
+                    'issuer' => 'Let\'s Encrypt',
+                    'subject' => 'demo-perfect.com',
+                    'valid_to' => date('Y-m-d H:i:s', time() + 86400 * 180),
+                    'days_remaining' => 180,
+                    'message' => 'SSL certificate is valid. Issuer: Let\'s Encrypt. Active for another 180 days.',
+                    'tip' => 'Your SSL is healthy. Continue monitoring and ensure automatic renewals remain active.'
+                ]
+            ],
+            'timestamp' => date('c')
+        ];
+    }
+
+    /**
+     * Generates simulated warning parameters.
+     */
+    private function getWarningSimulatedResults(): array
+    {
+        return [
+            'domain' => 'demo-warning.org',
+            'is_demo' => true,
+            'is_simulated' => true,
+            'score' => 60,
+            'checks' => [
+                'mx' => [
+                    'status' => 'valid',
+                    'records' => [
+                        ['host' => 'mail.demo-warning.org', 'pri' => 10]
+                    ],
+                    'message' => 'Found 1 MX record. Mail routing is correctly configured.',
+                    'tip' => 'Your MX records are active. Ensure the corresponding mail server IP addresses are clean and not blacklisted by spam databases.'
+                ],
+                'spf' => [
+                    'status' => 'warning',
+                    'record' => 'v=spf1 include:_spf.google.com +all',
+                    'message' => 'SPF record contains the highly insecure "+all" mechanism.',
+                    'tip' => 'The "+all" mechanism authorizes every server on the internet to send mail for you. Replace "+all" with "~all" (SoftFail) or "-all" (Fail) immediately.'
+                ],
+                'dmarc' => [
+                    'status' => 'warning',
+                    'record' => 'v=DMARC1; p=none; rua=mailto:reports@demo-warning.org',
+                    'message' => 'DMARC is set to monitoring-only policy (p=none).',
+                    'tip' => 'The "p=none" policy is great for initial testing to gather reports, but does not block spoofed emails. Once you confirm your authentic emails align properly, switch the policy to "p=quarantine" or "p=reject".'
+                ],
+                'dkim' => [
+                    'status' => 'info',
+                    'record' => null,
+                    'selector_used' => null,
+                    'message' => 'No DKIM records found under standard selectors (default, google, mail, k1, sig1).',
+                    'tip' => 'DKIM keys are published on specific selectors (e.g., mail._domainkey.domain.com). Since no selector was entered, we checked standard names but found none. Please type your actual selector in the field to check.'
+                ],
+                'ssl' => [
+                    'status' => 'warning',
+                    'issuer' => 'Sectigo Limited',
+                    'subject' => 'demo-warning.org',
+                    'valid_to' => date('Y-m-d H:i:s', time() + 86400 * 15),
+                    'days_remaining' => 15,
+                    'message' => 'SSL certificate is active but expires soon in 15 days.',
+                    'tip' => 'Set up automated Certbot renewal or contact your domain administrator to replace the certificate soon.'
+                ]
+            ],
+            'timestamp' => date('c')
+        ];
+    }
+
+    /**
+     * Generates simulated critical/failed parameters.
+     */
+    private function getCriticalSimulatedResults(bool $isOfflineSim): array
+    {
         $displayDomain = $isOfflineSim ? $this->domain : 'demo-critical.net';
-        
         return [
             'domain' => $displayDomain,
             'is_demo' => true,
+            'is_simulated' => true,
             'is_offline_sim' => $isOfflineSim,
             'score' => 20,
             'checks' => [
@@ -605,7 +766,7 @@ class DNSChecker
                     'status' => 'critical',
                     'records' => [],
                     'message' => 'No MX or A records found. This domain cannot receive emails.',
-                    'tip' => 'Add an MX record pointing to your mail server (e.g., mail.yourdomain.com) in your DNS panel (cPanel, Cloudflare, AWS Route 53) to route incoming emails correctly.'
+                    'tip' => 'Add an MX record pointing to your mail server (e.g., mail.yourdomain.com) in your DNS panel to route incoming emails correctly.'
                 ],
                 'spf' => [
                     'status' => 'critical',

@@ -20,3 +20,8 @@ Desktop.ini
 
 # Local php development server
 .router.php
+
+# Project guides
+_ANIMATION_GUIDE.md
+_WEBDEV_GUIDE.md
+_CYBERSECURITY_GUIDE.md
